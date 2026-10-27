@@ -11,12 +11,10 @@ jobs:
     timeout-minutes: 360
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Max free disk space
         run: |
-          echo "=== BEFORE ==="
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
@@ -30,8 +28,6 @@ jobs:
           sudo rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*.deb
           sudo docker image prune -a -f 2>/dev/null || true
           sudo rm -rf /var/lib/docker 2>/dev/null || true
-          sudo swapoff -a 2>/dev/null || true
-          echo "=== AFTER ==="
           df -h /
 
       - name: Install build dependencies
@@ -42,9 +38,8 @@ jobs:
             python3-setuptools rsync unzip zlib1g-dev file wget qemu-utils \
             subversion time xsltproc docbook-xsl libelf-dev
 
-      - name: Clone Lean's lede (shallow)
-        run: |
-          git clone https://github.com/coolsnowwolf/lede -b master openwrt --depth=1
+      - name: Clone Lean's lede
+        run: git clone https://github.com/coolsnowwolf/lede -b master openwrt --depth=1
 
       - name: Update and install feeds
         run: |
@@ -52,23 +47,31 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: Verify quantenna package present
+      - name: Verify quantenna
         run: |
           cd openwrt
-          test -f package/firmware/quantenna/Makefile \
-            && echo "quantenna package FOUND" \
-            || (echo "quantenna package MISSING" && exit 1)
+          test -f package/firmware/quantenna/Makefile && echo "quantenna FOUND" || exit 1
 
-      - name: Apply config
+      - name: Apply config and validate
         run: |
           cp .config openwrt/.config
           cd openwrt
           make defconfig
-          echo "=== packages enabled: $(grep -cE '^CONFIG_PACKAGE_.*=y' .config) ==="
+          echo "=== packages: $(grep -cE '^CONFIG_PACKAGE_.*=y' .config) ==="
           echo "=== quantenna ==="
-          grep -E "qtn-|quantenna" .config || echo "!!! NO QUANTENNA !!!"
+          grep -E "qtn-|quantenna" .config || (echo "FATAL: quantenna missing" && exit 1)
           echo "=== target ==="
-          grep -E "TARGET_BOARD|TARGET_PROFILE|TARGET_SUBTARGET" .config
+          grep -E "TARGET_BOARD|TARGET_PROFILE" .config
+          echo "=== node check (must be absent) ==="
+          if grep -qE "^CONFIG_PACKAGE_node=y" .config; then
+            echo "FATAL: node got pulled back in by defconfig!"
+            echo "--- who depends on node ---"
+            grep -E "^CONFIG_PACKAGE_.*(aliyun|node)" .config
+            exit 1
+          fi
+          echo "OK: node not present"
+          echo "=== e2guardian check ==="
+          grep -qE "^CONFIG_PACKAGE_e2guardian=y" .config && (echo "FATAL: e2guardian present" && exit 1) || echo "OK: e2guardian absent"
 
       - name: Download sources
         run: |
@@ -79,14 +82,36 @@ jobs:
       - name: Build firmware
         run: |
           cd openwrt
-          df -h /
-          set -o pipefail
-          make -j$(nproc) V=s 2>&1 | tail -200
-          echo "=== BUILD OK ==="
+          make -j$(nproc) V=s > /tmp/build.log 2>&1
+          echo "BUILD_EXIT=$?"
+        continue-on-error: true
+
+      - name: Diagnose
+        if: always()
+        run: |
+          echo "===== FAILED PACKAGES ====="
+          grep -oE "ERROR: package/[^ ]+ failed to build" /tmp/build.log | sort -u || echo "none"
+          echo "===== ERROR LINES ====="
+          grep -nE "make\[[0-9]\]: \*\*\*.*Error [12]$|^Error|error:" /tmp/build.log | tail -30 || true
+          echo "===== LAST 80 LINES ====="
+          tail -80 /tmp/build.log || true
+          echo "===== DISK ====="
           df -h /
 
+      - name: Check result
+        id: check
+        run: |
+          ls -la openwrt/bin/targets/ipq806x/generic/ 2>/dev/null || true
+          if ls openwrt/bin/targets/ipq806x/generic/*sysupgrade.bin >/dev/null 2>&1; then
+            echo "ok=1" >> $GITHUB_OUTPUT
+            echo "=== BUILD SUCCESS ==="
+          else
+            echo "ok=0" >> $GITHUB_OUTPUT
+            echo "=== BUILD FAILED ==="
+          fi
+
       - name: Collect artifacts
-        if: success()
+        if: steps.check.outputs.ok == '1'
         run: |
           cd openwrt
           mkdir -p ../out
@@ -96,11 +121,22 @@ jobs:
           cp .config ../out/config.used
           ls -la ../out
 
-      - name: Upload artifacts
-        if: success()
+      - name: Upload firmware
+        if: steps.check.outputs.ok == '1'
         uses: actions/upload-artifact@v4
         with:
           name: r7500-firmware
           path: out/
           retention-days: 30
-          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: /tmp/build.log
+          retention-days: 7
+
+      - name: Fail if build failed
+        if: steps.check.outputs.ok != '1'
+        run: exit 1
